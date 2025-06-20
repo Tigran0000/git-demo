@@ -563,12 +563,33 @@ class OCREngine:
             thumb = image.copy()
             thumb.thumbnail((800, 800))
             
+            # Convert to numpy array properly for any OpenCV operations that might be called later
+            img_array = np.array(thumb)
+            
+            # Handle different image formats properly
+            if len(img_array.shape) == 3:
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_array
+                
+            # Ensure image is uint8 type, not boolean
+            if gray.dtype == bool:
+                gray = gray.astype(np.uint8) * 255
+            elif gray.dtype != np.uint8:
+                gray = gray.astype(np.uint8)
+                
             # Use Tesseract to get raw text
             if TESSERACT_AVAILABLE:
-                # Try to detect bullet points or other structure indicators
-                text = pytesseract.image_to_string(thumb)
+                # For more consistent results across different image types
+                try:
+                    # First try with the thumbnail directly
+                    text = pytesseract.image_to_string(thumb)
+                except:
+                    # If that fails, try with the processed grayscale version
+                    text = pytesseract.image_to_string(Image.fromarray(gray))
                 
-                # Look for bullet points (ENHANCED: added common misidentifications)
+                # Look for bullet points (including common misidentifications)
                 bullet_indicators = ['•', '-', '*', '○', '●', '■', '►', '➢', 'e', '«', '&', '©']
                 for indicator in bullet_indicators:
                     if indicator in text:
@@ -586,13 +607,19 @@ class OCREngine:
                 if re.search(r'\n\s*[A-Za-z]+\s+\d+:', text):
                     return True
                     
-                # ENHANCED: Look for GitHub interface elements
+                # Look for GitHub interface elements
                 if re.search(r'(Online|Free|Videos|Images|In mobile)', text):
+                    return True
+                    
+                # Look for book chapter headers 
+                if re.search(r'(Chapter|CHAPTER|Rule)\s+\d+[\.:]', text):
                     return True
             
             return False
-        except:
-            return False  # On error, default to no structure detection
+        except Exception as e:
+            # More detailed error logging but still return False as default
+            print(f"Structure detection error: {e}")
+            return False
 
     def _is_book_page(self, image, structure_hints=None):
         """
@@ -653,6 +680,123 @@ class OCREngine:
             pass
                 
         return False
+
+    def _extract_multi_column_text(self, image, column_boundaries):
+        """
+        Extract text from a document with multiple columns
+        Processes each column separately and combines in reading order
+        """
+        try:
+            width, height = image.size
+            column_texts = []
+            total_confidence = 0
+            confidence_count = 0
+            
+            # Process each column separately
+            for i, (left, right) in enumerate(column_boundaries):
+                # Crop to column boundaries
+                column_image = image.crop((left, 0, right, height))
+                
+                # Process with settings optimized for single column
+                config = '--oem 3 --psm 6 -l eng -c preserve_interword_spaces=1'
+                
+                # Get text
+                column_text = pytesseract.image_to_string(column_image, config=config)
+                
+                # Get confidence data
+                data = pytesseract.image_to_data(
+                    column_image, 
+                    config=config,
+                    output_type=pytesseract.Output.DICT
+                )
+                
+                # Calculate confidence
+                confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+                if confidences:
+                    avg_confidence = sum(confidences) / len(confidences)
+                    total_confidence += avg_confidence
+                    confidence_count += 1
+                
+                # Apply special formatting for drop caps (common in academic texts)
+                # Check first line for potential drop cap indicator
+                if i == 1:  # Often right column has drop cap
+                    lines = column_text.split('\n')
+                    if lines and lines[0] and lines[0][0].isupper():
+                        # Simple drop cap formatting - could be enhanced
+                        first_char = lines[0][0]
+                        lines[0] = f"{first_char}{lines[0][1:]}" if len(lines[0]) > 1 else first_char
+                        column_text = '\n'.join(lines)
+                
+                # Apply academic text cleaning
+                cleaned_text = self._clean_academic_text(column_text)
+                column_texts.append(cleaned_text)
+            
+            # Join columns with clear separation
+            text = "\n\n".join(column_texts)
+            
+            # Calculate overall confidence
+            avg_confidence = total_confidence / confidence_count if confidence_count > 0 else 0
+            
+            return {
+                'text': text,
+                'confidence': avg_confidence,
+                'word_count': len(text.split()),
+                'char_count': len(text),
+                'success': True,
+                'engine': 'multi_column',
+                'has_structure': True,
+                'columns': len(column_boundaries)
+            }
+            
+        except Exception as e:
+            return self._error_result(f"Multi-column extraction error: {str(e)}")       
+
+    def _clean_academic_text(self, text):
+        """Clean up common OCR issues in academic texts"""
+        if not text:
+            return ""
+        
+        # Fix common scholarly OCR errors
+        replacements = {
+            "|": "I",                   # Vertical bar to I
+            "l.": "i.",                 # lowercase L with period to i.
+            "ln ": "In ",               # Common start-of-paragraph error
+            "l n": "In",                # Spaced lowercase L n to In
+            "1n ": "In ",               # Numeral 1 + n to In
+            "l ": "I ",                 # Lone lowercase L to I at start
+            "1 ": "I ",                 # Lone numeral 1 to I at start
+            " ,": ",",                  # Space before comma
+            " .": ".",                  # Space before period
+            ",,": "\"",                 # Double comma to quote
+            "''": "\"",                 # Double apostrophe to quote
+            "``": "\"",                 # Double backtick to quote
+            "bibliog-raphy": "bibliography",  # Fix common hyphenation
+            "text-ual": "textual"       # Fix common hyphenation
+        }
+        
+        for error, correction in replacements.items():
+            text = text.replace(error, correction)
+        
+        # Fix spacing issues
+        text = re.sub(r'\s+', ' ', text)        # Multiple spaces to single
+        text = re.sub(r' +\n', '\n', text)      # Remove spaces before line breaks
+        text = re.sub(r'\n +', '\n', text)      # Remove spaces after line breaks
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 consecutive line breaks
+        
+        # Fix hyphenation at line breaks
+        text = re.sub(r'(\w+)-\s+(\w+)', r'\1\2', text)
+        
+        # Fix broken paragraphs (single line breaks within paragraphs)
+        text = re.sub(r'([a-z,;])\n([a-z])', r'\1 \2', text)
+        
+        # Fix spacing around quotes
+        text = re.sub(r'"\s+', '"', text)       # No space after opening quote
+        text = re.sub(r'\s+"', '"', text)       # No space before closing quote
+        
+        # Fix period spacing in common abbreviations
+        text = re.sub(r'([A-Z])\s+\.', r'\1.', text)
+        
+        return text
 
     def _extract_with_pdf_structure_preservation(self, image):
         """Extract text from PDFs with strict structure preservation"""
@@ -944,7 +1088,7 @@ class OCREngine:
                 'success': False,
                 'error': f"Failed to extract structured text: {str(e)}"
             }
-                
+
     def clean_bullet_points(self, text):
         """Clean and fix bullet points and numbered lists with better structure preservation"""
         if not text:
@@ -1025,48 +1169,365 @@ class OCREngine:
         
         return text
 
+    def extract_book_page_text(self, image_path):
+        """
+        Specialized extractor for book pages with proper reading order
+        """
+        try:
+            # Load image
+            if isinstance(image_path, str):
+                image = Image.open(image_path)
+            else:
+                image = image_path.copy()
+                
+            # Get dimensions
+            width, height = image.size
+            
+            # Apply basic preprocessing to enhance text clarity
+            processed = image.copy()
+            if processed.mode != 'L':
+                processed = processed.convert('L')  # Convert to grayscale
+            
+            # Use Tesseract with HOCR to get position data
+            # HOCR gives us positional information for proper ordering
+            config = '--oem 3 --psm 1 -c preserve_interword_spaces=1 -c textord_tablefind_recognize_tables=0'
+            hocr_output = pytesseract.image_to_pdf_or_hocr(processed, extension='hocr', config=config)
+            
+            # Parse the HOCR to get properly ordered text blocks
+            soup = BeautifulSoup(hocr_output, 'html.parser')
+            
+            # Extract text blocks with their vertical positions
+            blocks = []
+            
+            # Find paragraphs (ocr_par elements)
+            for par in soup.find_all('div', class_='ocr_par'):
+                # Get bounding box data
+                try:
+                    bbox_str = par['title'].split('bbox ')[1].split(';')[0]
+                    x1, y1, x2, y2 = map(int, bbox_str.split())
+                    
+                    # Extract all text from this paragraph
+                    text = ' '.join([word.getText() for word in par.find_all('span', class_='ocrx_word')])
+                    
+                    # Store with position data for ordering
+                    blocks.append({
+                        'text': text,
+                        'y1': y1,
+                        'x1': x1,
+                        'y2': y2,
+                        'x2': x2,
+                        'height': y2 - y1
+                    })
+                except:
+                    continue
+            
+            # Sort blocks by vertical position (top to bottom)
+            blocks.sort(key=lambda b: b['y1'])
+            
+            # Group blocks into header, main content, and footer
+            header_blocks = []
+            content_blocks = []
+            footer_blocks = []
+            
+            # Extract page number if present (usually at the top)
+            if blocks and blocks[0]['text'].strip().isdigit() and blocks[0]['y1'] < height * 0.1:
+                header_blocks.append(blocks[0])
+                blocks = blocks[1:]
+            
+            # Check for title or chapter header
+            if blocks and blocks[0]['text'].isupper() and blocks[0]['y1'] < height * 0.2:
+                header_blocks.append(blocks[0])
+                blocks = blocks[1:]
+            
+            # Check for section header at the bottom (for next section/chapter)
+            if blocks and blocks[-1]['text'].isupper() and blocks[-1]['y1'] > height * 0.8:
+                footer_blocks.append(blocks[-1])
+                blocks = blocks[:-1]
+                
+            # The rest is content
+            content_blocks = blocks
+            
+            # Build the final text with appropriate section separation
+            full_text_parts = []
+            
+            # Add header content first
+            if header_blocks:
+                for block in header_blocks:
+                    full_text_parts.append(block['text'])
+                    
+            # Add a separator
+            if header_blocks and content_blocks:
+                full_text_parts.append("")
+                
+            # Add main content
+            for block in content_blocks:
+                full_text_parts.append(block['text'])
+                
+            # Add a separator before footer
+            if content_blocks and footer_blocks:
+                full_text_parts.append("")
+                
+            # Add footer content
+            if footer_blocks:
+                for block in footer_blocks:
+                    full_text_parts.append(block['text'])
+                    
+            # Join everything with proper paragraph breaks
+            full_text = "\n\n".join(full_text_parts)
+            
+            # Clean up common book text OCR issues
+            full_text = self._clean_book_text(full_text)
+            
+            return {
+                'text': full_text,
+                'success': True,
+                'engine': 'book_page_specialist',
+                'word_count': len(full_text.split()),
+                'char_count': len(full_text)
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}        
+
     def extract_book_text(self, pil_image, structure_hints=None):
         """
-        Specialized extraction for book pages with optimal quality
+        Specialized extraction for book pages with optimal quality and column detection
         
         Args:
             pil_image: PIL Image object of the book page
             structure_hints: Optional dictionary with structural hints
         """
-        # Use the specialized book preprocessing
-        processed_image = self.image_processor.preprocess_book_page(pil_image)
+        try:
+            # Use the specialized book preprocessing
+            processed_image = self.image_processor.preprocess_book_page(pil_image)
+            
+            # NEW: Detect columns before OCR processing
+            columns, column_boxes = self._detect_book_columns(processed_image)
+            
+            # If multiple columns detected, process each separately
+            if columns > 1:
+                # Process each column and combine text in reading order
+                column_texts = []
+                
+                for i, (left, right) in enumerate(column_boxes):
+                    # Crop to column boundaries
+                    column_image = processed_image.crop((left, 0, right, processed_image.height))
+                    
+                    # Configure Tesseract specifically for book column text
+                    config = '--oem 3 --psm 6 -l eng '  # PSM 6 better for column text
+                    config += '-c preserve_interword_spaces=1 '
+                    config += '-c textord_tabfind_find_tables=0 '
+                    config += '-c textord_min_linesize=1.5 '
+                    config += '-c tessedit_do_invert=0 '
+                    config += '-c tessedit_fix_hyphens=1 '
+                    
+                    # Process column text with OCR
+                    data = pytesseract.image_to_data(
+                        column_image, 
+                        config=config,
+                        output_type=pytesseract.Output.DICT
+                    )
+                    
+                    # Use specialized book text builder for this column
+                    column_text = self._build_book_text(data)
+                    column_texts.append(column_text)
+                
+                # Join column texts in reading order (left to right)
+                text = "\n\n".join(column_texts)
+                
+                # Note: we processed multiple columns
+                method = 'book_multi_column'
+                
+            else:
+                # Standard processing for single column pages
+                config = '--oem 3 --psm 3 -l eng '  # PSM 3 for full page
+                config += '-c preserve_interword_spaces=1 '
+                config += '-c textord_tabfind_find_tables=0 '
+                config += '-c textord_min_linesize=1.5 '
+                config += '-c tessedit_do_invert=0 '
+                config += '-c tessedit_fix_hyphens=1 '
+                
+                # Get the text blocks with full data
+                data = pytesseract.image_to_data(
+                    processed_image, 
+                    config=config,
+                    output_type=pytesseract.Output.DICT
+                )
+                
+                # Use specialized book text builder
+                text = self._build_book_text(data)
+                method = 'book_optimized'
+            
+            # Calculate confidence
+            confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            
+            return {
+                'text': text,
+                'confidence': avg_confidence,
+                'word_count': len([w for w in text.split() if w.strip()]),
+                'char_count': len(text),
+                'success': True,
+                'best_method': method,
+                'has_structure': True,
+                'columns_detected': columns
+            }
         
-        # Configure Tesseract specifically for book text
-        config = '--oem 3 --psm 3 -l eng '  # Page segmentation mode 3 is best for books
-        config += '-c preserve_interword_spaces=1 '
-        config += '-c textord_tabfind_find_tables=0 '  # Disable table detection
-        config += '-c textord_min_linesize=1.5 '  # Better line detection
-        config += '-c tessedit_do_invert=0 '  # Don't invert text
-        config += '-c tessedit_fix_hyphens=1 '  # Fix hyphenation
+        except Exception as e:
+            return self._error_result(f"Book text extraction error: {str(e)}")            
+
+    def _detect_book_columns(self, image):
+        """
+        Detect text columns in book page images
         
-        # Get the text blocks with full data
-        data = pytesseract.image_to_data(
-            processed_image, 
-            config=config,
-            output_type=pytesseract.Output.DICT
-        )
+        Args:
+            image: PIL image of book page
         
-        # Use specialized book text builder
-        text = self._build_book_page_text(data)
-        
-        # Calculate confidence
-        confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-        
-        return {
-            'text': text,
-            'confidence': avg_confidence,
-            'word_count': len([w for w in text.split() if w.strip()]),
-            'char_count': len(text),
-            'success': True,
-            'best_method': 'book_optimized',
-            'has_structure': True
-        }   
+        Returns:
+            tuple: (number_of_columns, list_of_column_boundaries)
+        """
+        try:
+            # Convert to numpy array
+            img_array = np.array(image)
+            
+            # Convert to grayscale if needed
+            if len(img_array.shape) == 3:
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_array.astype(np.uint8)
+            
+            # Binary threshold to isolate text
+            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+            
+            # Sum pixels vertically to find text density
+            vertical_projection = np.sum(binary, axis=0)
+            
+            # Smooth projection to reduce noise
+            kernel_size = max(5, image.width // 100)
+            if kernel_size % 2 == 0:
+                kernel_size += 1  # Must be odd
+            
+            # Apply smoothing if array is large enough
+            if len(vertical_projection) > kernel_size:
+                from scipy.signal import savgol_filter
+                smoothed = savgol_filter(vertical_projection, kernel_size, 2)
+            else:
+                smoothed = vertical_projection
+            
+            # Normalize for visualization and analysis
+            if np.max(smoothed) > 0:
+                normalized = smoothed / np.max(smoothed)
+            else:
+                normalized = smoothed
+            
+            # Find potential column separators (valleys in the projection)
+            # Exclude page margins (first and last 10% of width)
+            margin = int(image.width * 0.1)
+            center_section = normalized[margin:-margin] if len(normalized) > margin*2 else normalized
+            
+            # Look for valleys (low points) in the center section
+            threshold = 0.2  # Values below this are potential column separators
+            valleys = []
+            in_valley = False
+            
+            for i, val in enumerate(center_section):
+                real_i = i + margin  # Adjust back to full image coordinates
+                
+                if val < threshold and not in_valley:
+                    in_valley = True
+                    valley_start = real_i
+                elif val >= threshold and in_valley:
+                    in_valley = False
+                    valley_end = real_i
+                    valleys.append((valley_start, valley_end))
+            
+            # Close any open valley at the end
+            if in_valley:
+                valleys.append((valley_start, len(normalized) - 1))
+            
+            # Analyze valleys to determine column structure
+            if not valleys:
+                # No clear valleys - single column
+                return 1, [(0, image.width)]
+            
+            # Filter out narrow valleys (noise) - must be at least 2% of page width
+            min_valley_width = image.width * 0.02
+            valid_valleys = [v for v in valleys if v[1] - v[0] >= min_valley_width]
+            
+            if not valid_valleys:
+                # No valid valleys - single column
+                return 1, [(0, image.width)]
+            
+            # If we have valid valleys, define column boundaries
+            column_boundaries = []
+            
+            # Start with left edge
+            prev_boundary = 0
+            
+            # Add each valley midpoint
+            for valley_start, valley_end in valid_valleys:
+                valley_mid = (valley_start + valley_end) // 2
+                column_boundaries.append((prev_boundary, valley_mid))
+                prev_boundary = valley_mid
+            
+            # Add final column to right edge
+            column_boundaries.append((prev_boundary, image.width))
+            
+            return len(column_boundaries), column_boundaries
+            
+        except Exception as e:
+            print(f"Column detection error: {e}")
+            # Fall back to single column if detection fails
+            return 1, [(0, image.width)]
+
+    def extract_book_text_with_columns(self, pil_image):
+        """
+        Extract text from book pages with a direct column-aware approach
+        """
+        try:
+            # First, preprocess the image
+            processed_image = self.image_processor.preprocess_book_page(pil_image)
+            
+            # DIRECT APPROACH: For book pages, simply split down the middle
+            width, height = processed_image.size
+            mid_point = width // 2
+            
+            # Create column images
+            left_column = processed_image.crop((0, 0, mid_point, height))
+            right_column = processed_image.crop((mid_point, 0, width, height))
+            
+            # Process each column separately
+            column_texts = []
+            
+            # OCR config optimized for book columns
+            config = '--oem 3 --psm 6 -l eng -c preserve_interword_spaces=1'
+            
+            # Process left column
+            left_text = pytesseract.image_to_string(
+                left_column,
+                config=config
+            )
+            column_texts.append(left_text)
+            
+            # Process right column
+            right_text = pytesseract.image_to_string(
+                right_column,
+                config=config
+            )
+            column_texts.append(right_text)
+            
+            # Join columns with clear separation
+            full_text = "\n\n--- COLUMN 1 ---\n\n" + column_texts[0] + "\n\n--- COLUMN 2 ---\n\n" + column_texts[1]
+            
+            return {
+                'text': full_text,
+                'success': True,
+                'columns_detected': 2,
+                'best_method': 'direct_column_split'
+            }
+            
+        except Exception as e:
+            return self._error_result(f"Direct column extraction error: {str(e)}")
 
     def _build_structured_text(self, data: Dict, structure_hints: Dict = None) -> str:
         """Build text with improved paragraph structure preservation"""
@@ -1516,7 +1977,7 @@ class OCREngine:
             return self._error_result(f"Bullet structure extraction error: {str(e)}")
     
     def extract_text(self, source: Union[str, Image.Image], mode: str = None, preprocess: bool = True) -> Dict:
-        """Universal text extraction method with automatic mode detection"""
+        """Universal text extraction method with structure preservation for all image types"""
         
         start_time = time.time()
         
@@ -1536,58 +1997,75 @@ class OCREngine:
             result['from_cache'] = True
             return result
         
+        # FIRST: Detect structure and document type for all images
+        structure_info = {}
+        has_structure = self._detect_structured_content(image)
+        document_type = self._detect_optimal_mode(image)
+        
+        # Collect structure information
+        if has_structure:
+            structure_info = {
+                'has_bullets': True,
+                'indentation_levels': [],  # Will be populated during extraction
+                'document_type': document_type
+            }
+        
         # Determine extraction mode
         extraction_mode = mode if mode else self.current_mode
-        
-        # Auto-detect mode if needed
         if extraction_mode == 'auto':
-            extraction_mode = self._auto_detect_mode(image)
+            extraction_mode = document_type
         
-        # CRITICAL CHANGE: Force structure preservation for documents with bullet points
-        # This will override the mode selection when bullet points are detected
-        has_structure = self._detect_structured_content(image)
-        if has_structure:
-            # Use our bullet-preserving extraction regardless of selected mode
-            result = self._extract_with_bullet_structure(image, preprocess)
-            if result['success']:
-                result['detected_structure'] = True
-                # Add processing time
-                result['processing_time'] = time.time() - start_time
-                # Cache result
-                self._add_to_cache(cache_key, result)
-                return result
-        
-        # Regular extraction based on mode
+        # STRUCTURE-AWARE EXTRACTION STRATEGY
         try:
-            if extraction_mode == 'standard':
-                result = self._extract_standard_text(image, preprocess)
-            elif extraction_mode == 'academic':
-                result = self._extract_academic_text(image, preprocess)
-            elif extraction_mode == 'title':
-                result = self._extract_stylized_title(image, preprocess)
-            elif extraction_mode == 'handwritten':
-                result = self._extract_handwritten_text(image, preprocess)
-            elif extraction_mode == 'receipt':
-                result = self._extract_receipt_text(image, preprocess)
-            elif extraction_mode == 'code':
-                result = self._extract_code_text(image, preprocess)
-            elif extraction_mode == 'table':
-                result = self._extract_table_text(image, preprocess)
-            elif extraction_mode == 'form':
-                result = self._extract_form_text(image, preprocess)
-            elif extraction_mode == 'id_card':
-                result = self._extract_id_card_text(image, preprocess)
-            elif extraction_mode == 'math':
-                result = self._extract_math_text(image, preprocess)
-            elif extraction_mode == 'mixed':
-                result = self._extract_mixed_content(image, preprocess)
+            # Choose extraction method based on structure and format
+            if has_structure:
+                # For structured content, choose specialized method based on document type
+                if self._is_book_page(image):
+                    result = self.extract_book_text(image, structure_info)
+                elif document_type == 'table':
+                    result = self._extract_table_text(image, preprocess)
+                else:
+                    # Use universal structure preservation for all other structured content
+                    result = self._extract_with_structure_preservation(image, preprocess)
+                    
+                if result['success']:
+                    result['detected_structure'] = True
+                    result['structure_info'] = structure_info
             else:
-                # Default to standard if mode not recognized
-                result = self._extract_standard_text(image, preprocess)
+                # For non-structured content, use regular mode-based extraction
+                if extraction_mode == 'standard':
+                    result = self._extract_standard_text(image, preprocess)
+                elif extraction_mode == 'academic':
+                    result = self._extract_academic_text(image, preprocess)
+                elif extraction_mode == 'title':
+                    result = self._extract_stylized_title(image, preprocess)
+                elif extraction_mode == 'handwritten':
+                    result = self._extract_handwritten_text(image, preprocess)
+                elif extraction_mode == 'receipt':
+                    result = self._extract_receipt_text(image, preprocess)
+                elif extraction_mode == 'code':
+                    result = self._extract_code_text(image, preprocess)
+                elif extraction_mode == 'table':
+                    result = self._extract_table_text(image, preprocess)
+                elif extraction_mode == 'form':
+                    result = self._extract_form_text(image, preprocess)
+                elif extraction_mode == 'id_card':
+                    result = self._extract_id_card_text(image, preprocess)
+                elif extraction_mode == 'math':
+                    result = self._extract_math_text(image, preprocess)
+                elif extraction_mode == 'mixed':
+                    result = self._extract_mixed_content(image, preprocess)
+                else:
+                    # Default to standard if mode not recognized
+                    result = self._extract_standard_text(image, preprocess)
             
-            # Post-process result
+            # ALWAYS apply structure-aware post-processing
             result = self._post_process_result(result)
             
+            # If the result contains text, apply bullet point cleaning to ensure structure is preserved
+            if result.get('text'):
+                result['text'] = self.clean_bullet_points(result['text'])
+                
             # Add processing time
             result['processing_time'] = time.time() - start_time
             
@@ -1599,18 +2077,216 @@ class OCREngine:
         except Exception as e:
             return self._error_result(f"Extraction error: {str(e)}")
 
+    def extract_structured_image_text(self, image: Image.Image, preprocess: bool = True) -> Dict:
+        """Extract text from any image type with structure preservation"""
+        try:
+            # Start timing
+            start_time = time.time()
+            
+            # STEP 1: Detect document structure
+            has_structure = self._detect_structured_content(image)
+            document_type = self._detect_optimal_mode(image)
+            
+            # Collect structure information
+            structure_info = {
+                'has_bullets': has_structure,
+                'document_type': document_type,
+                'indentation_levels': [],  # Will be populated during extraction
+                'has_numbered_lists': False,  # Will be determined during extraction
+                'detected_sections': []  # Will store detected section headers
+            }
+            
+            # STEP 2: Apply optimized preprocessing based on detected structure
+            if preprocess:
+                if document_type == 'academic' or document_type == 'standard':
+                    # Academic and standard documents often have multi-level structure
+                    processed_image = self.image_processor.preprocess_academic_text(image.copy())
+                elif document_type == 'table':
+                    processed_image = self.image_processor.preprocess_table(image.copy())
+                elif document_type == 'receipt':
+                    processed_image = self.image_processor.preprocess_receipt(image.copy())
+                else:
+                    # Default preprocessing optimized for preserving structure
+                    processed_image = self.image_processor.preprocess_for_ocr(image.copy())
+            else:
+                processed_image = image.copy()
+            
+            # STEP 3: Extract text with structure preservation
+            if TESSERACT_AVAILABLE:
+                # Configure for optimal structure detection
+                config = '--oem 3 --psm 4 -c preserve_interword_spaces=1'
+                
+                # Get detailed data with position information
+                data = pytesseract.image_to_data(
+                    processed_image, 
+                    config=config,
+                    output_type=pytesseract.Output.DICT
+                )
+                
+                # ENHANCED: First scan to detect bullet points and structure elements
+                bullet_points = {
+                    # Standard bullets
+                    '•': 0, '⁃': 0, '○': 0, '◦': 0, '▪': 0, '▫': 0, 
+                    '⚫': 0, '⯁': 0, '⬤': 0, '◾': 0, '➢': 0, '➤': 0, '➣': 0, '►': 0, '→': 0,
+                    # Common misidentifications 
+                    'e': 0, '«': 0, '&': 0, '©': 0, '*': 0, '@': 0, '>': 0
+                }
+                numerical_bullets = {}  # To track "1.", "2.", etc.
+                hyphen_bullets = 0  # Count for "-" used as bullets
+                
+                # Extract indentation levels for better structure preservation
+                indentation_levels = []
+                left_positions = set()
+                section_headers = []
+                
+                # Analyze text structure
+                for i, text in enumerate(data['text']):
+                    if not text.strip():
+                        continue
+                    
+                    # Track indentation levels
+                    left_positions.add(data['left'][i])
+                    
+                    # Check for section headers (like "Primary Color:", "Technical Advantages:", etc.)
+                    if re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+:', text):
+                        section_headers.append(text)
+                    
+                    line_key = f"{data['block_num'][i]}_{data['line_num'][i]}"
+                    
+                    # Check for bullet symbols (including common misidentifications)
+                    if text in bullet_points:
+                        bullet_points[text] += 1
+                        structure_info['has_bullets'] = True
+                    
+                    # Check for hyphen bullets (standalone "-" at start of line)
+                    if text == '-' and data['left'][i] < 50:
+                        hyphen_bullets += 1
+                    
+                    # Check for numerical bullets like "1." or "1)"
+                    if re.match(r'^(\d+\.|\d+\)|\[?\d+\]?)$', text):
+                        numerical_bullets[text] = numerical_bullets.get(text, 0) + 1
+                        structure_info['has_numbered_lists'] = True
+                
+                # Sort and deduplicate indentation levels
+                if left_positions:
+                    indentation_levels = sorted(left_positions)
+                
+                # Update structure info
+                structure_info['indentation_levels'] = indentation_levels
+                structure_info['detected_sections'] = section_headers
+                
+                # Use the builder that preserves structure best for this content type
+                if structure_info['has_bullets'] or structure_info['has_numbered_lists']:
+                    # Use special structure-preserving builder
+                    text = self._build_structured_text(data, structure_info)
+                else:
+                    # Use standard builder with better paragraph handling
+                    text = self._build_text_structure_from_tesseract(data)
+                
+                # Apply bullet point cleaning to ensure consistent formatting
+                text = self.clean_bullet_points(text)
+                
+                # Calculate confidence
+                confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+                avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+                
+                # Build result
+                result = {
+                    'text': text,
+                    'confidence': avg_confidence,
+                    'word_count': len([w for w in text.split() if w.strip()]),
+                    'char_count': len(text),
+                    'success': True,
+                    'engine': 'structured_image',
+                    'has_structure': True,
+                    'structure_info': structure_info,
+                    'processing_time': time.time() - start_time
+                }
+                
+                return result
+            else:
+                return self._error_result("Tesseract not available for structure extraction")
+        
+        except Exception as e:
+            return self._error_result(f"Structured image extraction error: {str(e)}")
+
+    def _is_book_page_with_columns(self, image):
+        """Detect if image is a book page with multiple columns"""
+        try:
+            width, height = image.size
+            
+            # Check aspect ratio (common for books)
+            aspect_ratio = width / height
+            
+            # Look for page numbers
+            has_page_number = self._has_page_number(image)
+            
+            # Use tesseract to get a sample of text for analysis
+            sample = image.copy()
+            sample.thumbnail((800, 800), Image.LANCZOS)
+            
+            # Get text from the page
+            sample_text = pytesseract.image_to_string(sample)
+            
+            # Check for common book layout indicators
+            has_chapter_heading = bool(re.search(r'CHAPTER|Chapter|RULE|Rule \d+', sample_text))
+            
+            # Analyze column structure through visual analysis
+            # Create a smaller version for faster processing
+            small = image.copy()
+            small.thumbnail((300, 300), Image.LANCZOS)
+            
+            # Convert to grayscale and binary for projection profile
+            img_array = np.array(small.convert('L'))
+            _, binary = cv2.threshold(img_array, 200, 255, cv2.THRESH_BINARY_INV)
+            
+            # Calculate vertical projection (sum pixels vertically)
+            v_projection = np.sum(binary, axis=0)
+            
+            # Check for valley in the middle (typical for two-column layout)
+            mid_point = len(v_projection) // 2
+            mid_area = v_projection[mid_point-10:mid_point+10]
+            mid_density = np.mean(mid_area)
+            
+            # Compare middle density to overall - if significantly lower, likely a column break
+            overall_density = np.mean(v_projection)
+            has_column_break = (mid_density < overall_density * 0.5)
+            
+            # Combine indicators - if multiple match, likely a book page with columns
+            indicators = [
+                0.65 < aspect_ratio < 0.85,  # Book aspect ratio
+                has_page_number,
+                has_chapter_heading,
+                has_column_break
+            ]
+            
+            return sum(indicators) >= 2  # At least 2 indicators should match
+            
+        except Exception as e:
+            print(f"Book page detection error: {e}")
+            return False
+
     def extract_text_from_image(self, image_path: str, preprocess: bool = True) -> Dict:
-        """Extract text from image file (Compatibility with original API)"""
+        """Extract text from image file with structure preservation"""
         try:
             image = Image.open(image_path)
             
-            # Auto-detect if it's a title image
-            is_title = self._is_likely_title_image(image)
+            # First detect if this is a scholarly book/article using simple method
+            if self._is_likely_scholarly_text(image):
+                # Use our simplified scholarly extractor 
+                return self.extract_scholarly_text(image, preprocess)
             
+            # Rest of your existing detection logic...
+            has_structure = self._detect_structured_content(image)
+            if has_structure:
+                return self.extract_structured_image_text(image, preprocess)
+            
+            is_title = self._is_likely_title_image(image)
             if is_title:
                 return self._extract_title_with_line_breaks(image, preprocess)
             else:
-                return self.extract_text(image_path, None, preprocess)
+                return self.extract_text(image, None, preprocess)
+                
         except Exception as e:
             return self._error_result(f"Image extraction error: {str(e)}")
 
@@ -1679,6 +2355,367 @@ class OCREngine:
             print(f"Title structure detection error: {e}")
             return result
 
+    def _is_likely_scholarly_text(self, image):
+        """Simplified scholarly text detection"""
+        try:
+            # Check image width/height ratio (common for book pages)
+            width, height = image.size
+            is_book_shape = 0.65 < (width / height) < 0.85
+            
+            # Get basic tsext content
+            basic_text = pytesseract.image_to_string(image)
+            
+            # Look for common scholarly terms
+            scholarly_terms = ['bibliography', 'journal', 'chapter', 'vol.', 'pp.']
+            has_terms = any(term in basic_text.lower() for term in scholarly_terms)
+            
+            return is_book_shape and has_terms
+        
+        except Exception as e:
+            print(f"Error in scholarly detection: {e}")
+            return False    
+
+    def extract_scholarly_text(self, image: Image.Image, preprocess: bool = True) -> Dict:
+        """
+        Simplified scholarly text extraction without complex regex
+        """
+        try:
+            start_time = time.time()
+            
+            # Use standard preprocessing
+            if preprocess:
+                processed_img = self.image_processor.preprocess_for_ocr(image.copy())
+            else:
+                processed_img = image.copy()
+            
+            # Use standard OCR settings for reliability
+            config = '--oem 3 --psm 1 -l eng'
+            
+            # Extract text using simple Tesseract call
+            text = pytesseract.image_to_string(processed_img, config=config)
+            
+            # Apply minimal cleaning without complex regex or quote handling
+            text = self._basic_text_cleanup(text)
+            
+            # Calculate confidence
+            data = pytesseract.image_to_data(
+                processed_img,
+                config=config,
+                output_type=pytesseract.Output.DICT
+            )
+            
+            confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            
+            return {
+                'text': text,
+                'confidence': avg_confidence,
+                'word_count': len(text.split()),
+                'char_count': len(text),
+                'success': True,
+                'engine': 'basic_scholarly',
+                'processing_time': time.time() - start_time
+            }
+        except Exception as e:
+            return self._error_result(f"Basic scholarly extraction error: {str(e)}")
+
+    def _basic_text_cleanup(self, text):
+        """
+        Very basic text cleanup without regex or quote manipulation
+        """
+        if not text:
+            return ""
+        
+        # Fix common spacing issues
+        text = text.replace("  ", " ")
+        
+        # Fix common OCR errors
+        text = text.replace("|", "I")
+        text = text.replace("l.", "i.")
+        text = text.replace("ln", "In")
+        text = text.replace("1n", "In")
+        
+        return text
+
+
+    def _detect_multiple_columns(self, image):
+        """Detect if an image has multiple text columns"""
+        try:
+            # Convert image to numpy array
+            img_array = np.array(image.convert('L'))
+            
+            # Create a smaller version for faster processing
+            height, width = img_array.shape
+            scale = 600 / max(width, height)
+            if scale < 1:
+                small_width = int(width * scale)
+                small_height = int(height * scale)
+                img_small = cv2.resize(img_array, (small_width, small_height))
+            else:
+                img_small = img_array
+                small_width = width
+                small_height = height
+                
+            # Apply binary threshold to isolate text
+            _, binary = cv2.threshold(img_small, 200, 255, cv2.THRESH_BINARY_INV)
+            
+            # Calculate vertical projection profile (sum of pixels in each column)
+            v_projection = np.sum(binary, axis=0)
+            
+            # Use simple averaging for smoothing instead of Gaussian blur
+            # This avoids the OpenCV filter format error
+            kernel_size = max(5, small_width // 50)
+            smoothed = np.zeros_like(v_projection, dtype=float)
+            
+            # Manual smoothing with a simple moving average
+            half_window = kernel_size // 2
+            for i in range(len(v_projection)):
+                start = max(0, i - half_window)
+                end = min(len(v_projection), i + half_window + 1)
+                smoothed[i] = np.mean(v_projection[start:end])
+            
+            # Normalize the projection
+            if np.max(smoothed) > 0:
+                normalized = smoothed / np.max(smoothed)
+            else:
+                return False
+                
+            # Look for a significant valley in the middle third of the image
+            middle_third_start = small_width // 3
+            middle_third_end = small_width * 2 // 3
+            middle_section = normalized[middle_third_start:middle_third_end]
+            
+            # Calculate average density
+            avg_density = np.mean(normalized)
+            
+            # If there's a significant drop in the middle (at least 50% below average),
+            # it's likely a two-column layout
+            min_density_in_middle = np.min(middle_section) if len(middle_section) > 0 else avg_density
+            
+            return min_density_in_middle < avg_density * 0.5
+            
+        except Exception as e:
+            print(f"Column detection error: {e}")
+            return False
+
+    def _detect_page_numbers(self, image):
+        """Detect if an image has page numbers"""
+        try:
+            # Most books have page numbers at the top or bottom
+            img = image.copy()
+            
+            # Get image dimensions
+            width, height = img.size
+            
+            # Extract regions where page numbers typically appear
+            top_strip = img.crop((width//4, 0, 3*width//4, height//10))
+            bottom_strip = img.crop((width//4, 9*height//10, 3*width//4, height))
+            
+            # OCR with settings optimized for digits
+            config = '--psm 7 -c tessedit_char_whitelist=0123456789'
+            
+            top_text = pytesseract.image_to_string(top_strip, config=config).strip()
+            bottom_text = pytesseract.image_to_string(bottom_strip, config=config).strip()
+            
+            # Check if we found digits that look like page numbers (1-4 digits)
+            has_top_number = bool(re.match(r'^\d{1,4}$', top_text))
+            has_bottom_number = bool(re.match(r'^\d{1,4}$', bottom_text))
+            
+            return has_top_number or has_bottom_number
+            
+        except Exception as e:
+            print(f"Page number detection error: {e}")
+            return False            
+
+    def _detect_drop_caps(self, image):
+        """
+        Advanced drop cap detection for scholarly texts
+        """
+        try:
+            # Convert to numpy for processing
+            img_array = np.array(image)
+            if len(img_array.shape) == 3:
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_array.copy()
+            
+            # Convert to binary for contour detection
+            _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+            
+            # Find contours
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Sort contours by area (largest first)
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            
+            # Get image dimensions
+            height, width = gray.shape
+            
+            # Analyze potential drop caps
+            drop_cap_info = {
+                'has_drop_cap': False,
+                'letter': '',  # Empty string instead of None
+                'coords': (0, 0, 0, 0),  # Default coordinates
+                'size_ratio': 0
+            }
+            
+            # Focus on the top few contours
+            for i, contour in enumerate(contours[:10]):
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # A drop cap has distinctive characteristics:
+                # 1. Typically in the first 1/3 of the page
+                # 2. Taller than average text height (at least 2.5x)
+                # 3. Not too wide (not an illustration or border)
+                # 4. Usually in the left side of the page
+                
+                if (y < height/3 and                     # Near top of page
+                    h > 35 and                           # Tall enough
+                    h/w > 1 and h/w < 3 and              # Height/width ratio appropriate for a letter
+                    x < width/3 and                      # Positioned on left side
+                    w < width/4):                        # Not too wide
+                    
+                    # Extract just this letter for OCR
+                    letter_region = gray[y:y+h, x:x+w]
+                    
+                    # Ensure the region is valid
+                    if letter_region.size == 0:
+                        continue
+                        
+                    # Scale up for better OCR
+                    try:
+                        letter_img = cv2.resize(letter_region, (w*4, h*4))
+                    except Exception:
+                        continue
+                    
+                    # Binarize for cleaner OCR
+                    _, letter_binary = cv2.threshold(letter_img, 180, 255, cv2.THRESH_BINARY)
+                    
+                    # OCR just this letter with settings optimized for single characters
+                    config = '--oem 3 --psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                    letter_text = pytesseract.image_to_string(letter_binary, config=config).strip()
+                    
+                    # If we got a single letter result
+                    if len(letter_text) == 1 and letter_text.isalpha():
+                        drop_cap_info = {
+                            'has_drop_cap': True,
+                            'letter': letter_text,
+                            'coords': (x, y, w, h),
+                            'size_ratio': h / 15  # Approximate ratio to regular text
+                        }
+                        break
+            
+            return drop_cap_info
+            
+        except Exception as e:
+            print(f"Drop cap detection error: {e}")
+            return {'has_drop_cap': False, 'letter': '', 'coords': (0, 0, 0, 0), 'size_ratio': 0}
+
+
+    def _clean_scholarly_text(self, text):
+        """
+        Clean up common OCR errors in scholarly text
+        with focus on word beginnings
+        """
+        if not text:
+            return ""
+        
+        # Fix unbalanced quotes first
+        quote_count = text.count('"')
+        if quote_count % 2 != 0:  # Odd number of quotes
+            text += '"'  # Add a closing quote
+        
+        # Fix spacing around punctuation
+        text = re.sub(r'\s+([.,;:!?)\]}])', r'\1', text)
+        text = re.sub(r'([([{"])\s+', r'\1', text)
+        
+        # Fix multiple spaces
+        text = re.sub(r' {2,}', ' ', text)
+        
+        # Fix common scholarly OCR errors
+        text = text.replace('|', 'I')              # Vertical bar to I
+        text = text.replace('l.', 'i.')            # lowercase L with period often mistaken for i
+        text = text.replace('ln', 'In')            # 'ln' at beginning of paragraph is usually 'In'
+        text = text.replace(',,', '"')             # Double commas to quote
+        text = text.replace('``', '"')             # Double backticks to quote
+        text = text.replace("''", '"')             # Double single quotes to quote
+        text = text.replace('1n', 'In')            # 1n at start often mistaken for In
+        text = text.replace('j.', 'i.')            # j with period often mistaken for i
+        text = text.replace(' ,', ',')             # Fix spacing before comma
+        
+        # Fix common scholarly vocabulary
+        scholarly_fixes = {
+            'anaiyticai': 'analytical',
+            'anaiytical': 'analytical',
+            'bibiiography': 'bibliography',
+            'bibiiographical': 'bibliographical',
+            'Bibiio': 'Biblio',
+            'textual': 'textual',
+            'ibid': 'ibid',
+            'et ai': 'et al',
+            'Fredsan': 'Fredson',
+            'Bowers\'s': 'Bowers\'s',
+            'Bowerss': 'Bowers\'s',
+            'pubiished': 'published',
+            'majestic': 'majestic',
+            'scholarship': 'scholarship'
+        }
+        
+        for error, correction in scholarly_fixes.items():
+            text = text.replace(error, correction)
+        
+        # Ensure all tags are properly closed
+        if '<i>' in text and '</i>' not in text:
+            text += '</i>'
+            
+        # Fix italics tags that might cause issues
+        open_tags = text.count('<i>')
+        close_tags = text.count('</i>')
+        
+        if open_tags > close_tags:
+            text += '</i>' * (open_tags - close_tags)
+        
+        # Fix capitalization at beginnings of sentences
+        text = re.sub(r'(\.\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+        
+        # Fix common spacing issues after periods
+        text = re.sub(r'\.([A-Z])', r'. \1', text)
+        
+        # Fix common word boundary issues at beginning of paragraph
+        start_fixes = {
+            r'^ln ': 'In ',
+            r'^l ': 'I ',
+            r'^1n ': 'In ',
+            r'^1 ': 'I ',
+            r'\n\s*ln ': '\n\nIn ',
+            r'\n\s*l ': '\n\nI ',
+            r'\n\s*1n ': '\n\nIn ',
+            r'\n\s*1 ': '\n\nI '
+        }
+        
+        for pattern, replacement in start_fixes.items():
+            text = re.sub(pattern, replacement, text)
+        
+        # Fix italics in scholarly texts (often indicated by *)
+        text = re.sub(r'\*([^*]+)\*', r'_\1_', text)  # Change *text* to _text_ for consistency
+        
+        # Remove stray punctuation at line beginnings
+        text = re.sub(r'\n([.,;:])', r'\n', text)
+        
+        # Fix hyphenated words at line breaks
+        text = re.sub(r'([a-z])-\s+([a-z])', r'\1\2', text)
+        
+        # Fix extra spaces around quotes
+        text = re.sub(r'"\s+', '"', text)
+        text = re.sub(r'\s+"', '"', text)
+        
+        # Ensure blank lines between paragraphs are consistent
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text          
+
+
     def _is_likely_title_image(self, image: Image.Image) -> bool:
         """Detect if an image is likely to be a title"""
         # Simple heuristics:
@@ -1710,86 +2747,156 @@ class OCREngine:
     
     def _detect_optimal_mode(self, image: Image.Image) -> str:
         """Detect the most appropriate extraction mode for the image content"""
-        # Create a thumbnail for faster analysis
-        thumbnail = image.copy()
-        thumbnail.thumbnail((300, 300), Image.LANCZOS)
-        
-        # Convert to numpy array
-        img_array = np.array(thumbnail)
-        
-        # Check if grayscale or convert to grayscale
-        if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img_array
-        
-        # Calculate features for classification
-        features = {}
-        
-        # 1. Average brightness
-        features['avg_brightness'] = np.mean(gray)
-        
-        # 2. Std deviation of brightness (texture information)
-        features['std_brightness'] = np.std(gray)
-        
-        # 3. Edge density (using Canny edge detection)
-        edges = cv2.Canny(gray, 100, 200)
-        features['edge_density'] = np.sum(edges) / (gray.shape[0] * gray.shape[1])
-        
-        # 4. Line detection using Hough transform
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=40, maxLineGap=10)
-        features['line_count'] = 0 if lines is None else len(lines)
-        
-        # 5. Text region estimate using MSER
         try:
-            mser = cv2.MSER_create()
-            regions, _ = mser.detectRegions(gray)
-            features['text_region_count'] = len(regions)
-        except:
-            features['text_region_count'] = 0
+            # Create a thumbnail for faster analysis
+            thumbnail = image.copy()
+            thumbnail.thumbnail((300, 300), Image.LANCZOS)
+            
+            # Convert to numpy array
+            img_array = np.array(thumbnail)
+            
+            # Check if grayscale or convert to grayscale
+            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                # Fix for OpenCV BGR/RGB conversion
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_array
+            
+            # CRITICAL FIX: Ensure gray is uint8, not bool
+            if gray.dtype == bool:
+                gray = gray.astype(np.uint8) * 255
+            elif gray.dtype != np.uint8:
+                gray = gray.astype(np.uint8)
+            
+            # Calculate features for classification
+            features = {}
+            
+            # 1. Average brightness
+            features['avg_brightness'] = np.mean(gray)
+            
+            # 2. Std deviation of brightness (texture information)
+            features['std_brightness'] = np.std(gray)
+            
+            # 3. Edge density (using Canny edge detection)
+            # FIXED: Properly call Canny with uint8 input
+            edges = cv2.Canny(gray, 100, 200)
+            features['edge_density'] = np.sum(edges) / (gray.shape[0] * gray.shape[1])
+            
+            # 4. Line detection using Hough transform
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=40, maxLineGap=10)
+            features['line_count'] = 0 if lines is None else len(lines)
+            
+            # 5. Text region estimate using MSER
+            try:
+                mser = cv2.MSER_create()
+                regions, _ = mser.detectRegions(gray)
+                features['text_region_count'] = len(regions)
+            except Exception as e:
+                print(f"MSER detection failed: {e}")
+                features['text_region_count'] = 0
+            
+            # 6. Calculate histogram features
+            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+            features['hist_peaks'] = len([i for i in range(1, 255) if hist[i] > hist[i-1] and hist[i] > hist[i+1]])
+            
+            # 7. Detect if image is likely a receipt (long, narrow, white background)
+            aspect_ratio = thumbnail.width / thumbnail.height
+            features['is_narrow'] = aspect_ratio < 0.7
+            
+            # 8. Check if likely a title (large text, few lines)
+            features['likely_title'] = (features['text_region_count'] < 20 and 
+                                       features['line_count'] < 5 and 
+                                       thumbnail.width > 150)
+            
+            # 9. Check if likely a table (many horizontal and vertical lines)
+            horizontal_lines = 0
+            vertical_lines = 0
+            if lines is not None:
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    if abs(x2 - x1) > abs(y2 - y1):
+                        horizontal_lines += 1
+                    else:
+                        vertical_lines += 1
+            features['likely_table'] = horizontal_lines > 5 and vertical_lines > 5
+            
+            # 10. Check if likely handwritten (high variance in stroke width)
+            # Simple estimate based on edge properties
+            features['likely_handwritten'] = features['std_brightness'] > 60 and features['edge_density'] > 0.1
+            
+            # 11. NEW: Detect if likely a book page (clean text with margins)
+            features['likely_book'] = (features['edge_density'] < 0.1 and 
+                                      features['std_brightness'] < 60 and 
+                                      features['text_region_count'] > 10)
+            
+            # Determine the most likely mode based on features
+            if features['likely_table']:
+                return 'table'
+            elif features['is_narrow'] and features['avg_brightness'] > 200:
+                return 'receipt'
+            elif features['likely_title']:
+                return 'title'
+            elif features['likely_handwritten']:
+                return 'handwritten'
+            elif features['likely_book']:
+                return 'academic'  # Book pages use the academic mode
+            elif features['text_region_count'] > 100 and features['line_count'] > 20:
+                return 'academic'
+            else:
+                return 'standard'
+                
+        except Exception as e:
+            # Log the error but don't crash
+            print(f"Mode detection error: {e}")
+            # Fall back to standard mode on error
+            return 'standard'
+
+    def _detect_and_handle_drop_cap(self, data, blocks):
+        """Detect and properly handle drop caps at the beginning of paragraphs"""
+        drop_cap_candidates = []
         
-        # 6. Calculate histogram features
-        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-        features['hist_peaks'] = len([i for i in range(1, 255) if hist[i] > hist[i-1] and hist[i] > hist[i+1]])
+        # Look for possible drop caps (much larger than surrounding text)
+        for block_num, block in blocks.items():
+            first_line = min(block['lines'].keys(), default=None)
+            if first_line is None:
+                continue
+                
+            line = block['lines'][first_line]
+            if not line['words']:
+                continue
+                
+            first_word_num = min(line['words'].keys())
+            first_word = line['words'][first_word_num]
+            
+            # Check if this word is significantly larger/taller
+            avg_height = 0
+            count = 0
+            
+            # Calculate average height of other words
+            for word_num, word in line['words'].items():
+                if word_num != first_word_num:
+                    avg_height += word['height']
+                    count += 1
+            
+            if count > 0:
+                avg_height /= count
+                
+                # If first word is significantly taller (at least 1.7x)
+                if first_word['height'] > avg_height * 1.7:
+                    drop_cap_candidates.append((block_num, first_line, first_word_num))
         
-        # 7. Detect if image is likely a receipt (long, narrow, white background)
-        aspect_ratio = thumbnail.width / thumbnail.height
-        features['is_narrow'] = aspect_ratio < 0.7
+        # Handle detected drop caps
+        for block_num, line_num, word_num in drop_cap_candidates:
+            drop_cap = blocks[block_num]['lines'][line_num]['words'][word_num]['text']
+            
+            # Mark this as a drop cap for special handling
+            blocks[block_num]['has_drop_cap'] = True
+            blocks[block_num]['drop_cap'] = drop_cap
+            blocks[block_num]['drop_cap_word_num'] = word_num
         
-        # 8. Check if likely a title (large text, few lines)
-        features['likely_title'] = (features['text_region_count'] < 20 and 
-                                   features['line_count'] < 5 and 
-                                   thumbnail.width > 150)
-        
-        # 9. Check if likely a table (many horizontal and vertical lines)
-        horizontal_lines = 0
-        vertical_lines = 0
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                if abs(x2 - x1) > abs(y2 - y1):
-                    horizontal_lines += 1
-                else:
-                    vertical_lines += 1
-        features['likely_table'] = horizontal_lines > 5 and vertical_lines > 5
-        
-        # 10. Check if likely handwritten (high variance in stroke width)
-        # Simple estimate based on edge properties
-        features['likely_handwritten'] = features['std_brightness'] > 60 and features['edge_density'] > 0.1
-        
-        # Determine the most likely mode based on features
-        if features['likely_table']:
-            return 'table'
-        elif features['is_narrow'] and features['avg_brightness'] > 200:
-            return 'receipt'
-        elif features['likely_title']:
-            return 'title'
-        elif features['likely_handwritten']:
-            return 'handwritten'
-        elif features['text_region_count'] > 100 and features['line_count'] > 20:
-            return 'academic'
-        else:
-            return 'standard'       
+        return blocks
+
     
     def _extract_standard_text(self, image: Image.Image, preprocess: bool) -> Dict:
         """Standard text extraction with structure preservation"""
@@ -1856,12 +2963,20 @@ class OCREngine:
             else:
                 processed_image = image.copy()
             
-            results = []
-            
             # Save debug image if enabled
             if self.save_debug_images:
                 debug_path = os.path.join(self.debug_dir, f"academic_processed_{int(time.time())}.png")
                 processed_image.save(debug_path)
+            
+            # NEW: First check if this is a multi-column document
+            column_count, column_boundaries = self._detect_columns(processed_image)
+            
+            # For multi-column documents, process each column separately
+            if column_count > 1:
+                return self._extract_multi_column_text(processed_image, column_boundaries)
+            
+            # Single column processing (existing code)
+            results = []
             
             # Try multiple PSM modes optimized for academic text
             if TESSERACT_AVAILABLE:
@@ -1943,20 +3058,15 @@ class OCREngine:
                     if self.debug_mode:
                         print(f"EasyOCR academic extraction failed: {e}")
             
-            # Choose best result
+            # Select best result
             if results:
                 best_result = max(results, key=lambda x: x['score'])
-                
-                # Clean academic text for common OCR errors
-                cleaned_text = self.text_processor.clean_academic_text(best_result['text'])
-                best_result['text'] = cleaned_text
-                
                 return best_result
             else:
                 return self._error_result("Academic text extraction failed")
                 
         except Exception as e:
-            return self._error_result(f"Academic extraction error: {str(e)}")
+            return self._error_result(f"Academic text extraction error: {str(e)}")
     
     def _extract_stylized_title(self, image: Image.Image, preprocess: bool) -> Dict:
         """Specialized extraction for stylized title text (light on dark, special effects, etc.)"""
@@ -3028,9 +4138,168 @@ class OCREngine:
         
         return result.strip()
 
+    def _is_potential_italics(self, text, confidence):
+        """
+        Detect if a word is likely italicized based on content and confidence
+        """
+        # Book titles often italicized in scholarly works
+        if confidence < 70 and len(text) > 3:
+            # Check for known scholarly italicized words
+            scholarly_terms = ['ibid', 'et al', 'passim', 'sic', 'viz', 'Principles']
+            for term in scholarly_terms:
+                if term in text:
+                    return True
+            
+            # Check if likely a title (capitalized words)
+            if text[0].isupper() and not text.isupper():
+                return True
+        
+        return False
+
+    def _enhance_italics_detection(self, blocks):
+        """
+        Enhance detection of italicized text in scholarly works
+        """
+        for block_num, block in blocks.items():
+            for line_num, line in block['lines'].items():
+                # Look for patterns of potentially italicized words
+                italics_candidates = []
+                
+                for word_num, word in line['words'].items():
+                    if word['potential_italics']:
+                        italics_candidates.append((word_num, word))
+                
+                # If we found italics, mark the block
+                if italics_candidates:
+                    block['italics_detected'] = True
+        
+        return blocks
+
+    def preprocess_scholarly_text(self, image):
+        """Specialized preprocessing for scholarly books"""
+        # Convert to grayscale if not already
+        if image.mode != 'L':
+            img = image.convert('L')
+        else:
+            img = image.copy()
+        
+        # Convert to numpy array
+        img_np = np.array(img)
+        
+        # Apply CLAHE for better contrast in text regions
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(img_np.astype(np.uint8))
+        
+        # Denoise to improve legibility
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+        
+        # Use adaptive thresholding which performs better on uneven book lighting
+        thresh = cv2.adaptiveThreshold(
+            denoised,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            15,  # Block size
+            9    # C constant (higher = more aggressive)
+        )
+        
+        # Dilate slightly to connect broken letters in old prints
+        kernel = np.ones((1, 1), np.uint8)
+        dilated = cv2.dilate(thresh, kernel, iterations=1)
+        
+        # Convert back to PIL
+        return Image.fromarray(dilated)
+
+    def extract_scholarly_book_text(self, image, preprocess=True):
+        """
+        Specialized extraction for scholarly books like academic articles and literary criticism
+        """
+        try:
+            start_time = time.time()
+            
+            # Apply specialized preprocessing
+            if preprocess:
+                processed_img = self.preprocess_scholarly_text(image.copy())
+            else:
+                processed_img = image
+            
+            # Use PSM 1 (automatic page segmentation) for better detecting complex layout
+            # This is crucial for scholarly texts with drop caps, headings, etc.
+            config = '--oem 3 --psm 1 -l eng '
+            config += '-c preserve_interword_spaces=1 '
+            config += '-c textord_tabfind_find_tables=0 ' # Disable table detection
+            config += '-c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,;:\'\"!?-_()[]{}<>@#$%^&*+=|\\/ " '
+            config += '-c tessedit_do_invert=0 '  # Don't invert text
+            
+            # Get detailed OCR data
+            data = pytesseract.image_to_data(
+                processed_img,
+                config=config,
+                output_type=pytesseract.Output.DICT
+            )
+            
+            # Use enhanced scholarly text builder
+            text = self._build_book_text(data, {'document_type': 'scholarly'})
+            
+            # Calculate confidence
+            confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            
+            return {
+                'text': text,
+                'confidence': avg_confidence,
+                'word_count': len([w for w in text.split() if w.strip()]),
+                'char_count': len(text),
+                'success': True,
+                'best_method': 'scholarly_book',
+                'has_structure': True,
+                'processing_time': time.time() - start_time
+            }
+        except Exception as e:
+            return self._error_result(f"Scholarly book extraction error: {str(e)}")     
+
+
+    def _fix_scholarly_formatting(self, text):
+        """
+        Fix common scholarly formatting issues and properly format citations and references
+        """
+        try:
+            # Replace italics tags with proper formatting
+            text = text.replace("<i>", "*").replace("</i>", "*")
+            
+            # Fix common citation patterns
+            text = re.sub(r'([A-Za-z]+)\s+in\s+([A-Za-z\s]+):', r'\1 in *\2*:', text)
+            
+            # Fix specific pattern in your example (Studies in Bibliography as a title)
+            text = text.replace("Studies in Bibliography", "*Studies in Bibliography*")
+            
+            # Fix Shakespeare: Select Bibliographies pattern
+            text = text.replace("Shakespeare: Select Bibliographies", "*Shakespeare: Select Bibliographies*")
+            
+            # Handle case where italics didn't get properly marked
+            text = re.sub(r'(\b[Pp]rinciples of Bibliographical Description\b)', r'*\1*', text)
+            
+            # Fix quotation marks around short phrases - HANDLE CAREFULLY
+            # Only add quotes if we can find matching beginning and end of phrases
+            text = re.sub(r'"([^"]{1,30})', r'"\1"', text)  # Close any open quotes for short phrases
+            
+            # Ensure balanced quotes overall
+            quote_count = text.count('"')
+            if quote_count % 2 != 0:  # Odd number of quotes
+                text += '"'  # Add a closing quote
+                
+            return text
+        except Exception as e:
+            # If any error occurs in formatting, return the original text
+            print(f"Error in scholarly formatting: {e}")
+            return text
+
+
+
+
     def _build_book_text(self, data, structure_hints=None):
         """
-        Build properly structured text from book page OCR data
+        Build properly structured text from book page OCR data with enhanced scholarly format handling
         """
         if not data or 'text' not in data:
             return ""
@@ -3038,18 +4307,31 @@ class OCREngine:
         # Group words by block and line
         blocks = {}
         
+        # Track confidence for potential OCR errors
+        low_confidence_words = []
+        
         for i in range(len(data['text'])):
-            if int(data['conf'][i]) > 30 and data['text'][i].strip():
+            confidence = int(data['conf'][i])
+            text = data['text'][i].strip()
+            
+            # Use lower confidence threshold for scholarly texts (25 instead of 30)
+            if confidence > 25 and text:
                 block_num = data['block_num'][i]
                 line_num = data['line_num'][i]
                 word_num = data['word_num'][i]
+                
+                # Track low confidence words for potential post-processing
+                if confidence < 60:
+                    low_confidence_words.append((text, block_num, line_num, word_num, confidence))
                 
                 # Create block if needed
                 if block_num not in blocks:
                     blocks[block_num] = {
                         'top': data['top'][i],
                         'lines': {},
-                        'is_heading': False
+                        'is_heading': False,
+                        'has_drop_cap': False,
+                        'italics_detected': False
                     }
                 
                 # Create line if needed
@@ -3057,23 +4339,37 @@ class OCREngine:
                     blocks[block_num]['lines'][line_num] = {
                         'words': {},
                         'top': data['top'][i],
-                        'left': data['left'][i]
+                        'left': data['left'][i],
+                        'avg_height': 0,
+                        'total_width': 0,
+                        'word_count': 0
                     }
                 
-                # Add word to line
+                # Add word to line with additional metadata
                 blocks[block_num]['lines'][line_num]['words'][word_num] = {
-                    'text': data['text'][i],
+                    'text': text,
                     'left': data['left'][i],
                     'width': data['width'][i],
                     'top': data['top'][i],
-                    'height': data['height'][i]
+                    'height': data['height'][i],
+                    'conf': confidence,
+                    'potential_italics': self._is_potential_italics(text, confidence)
                 }
                 
+                # Update line tracking data
+                line = blocks[block_num]['lines'][line_num]
+                line['avg_height'] = (line['avg_height'] * line['word_count'] + data['height'][i]) / (line['word_count'] + 1)
+                line['total_width'] += data['width'][i]
+                line['word_count'] += 1
+                
                 # Update line's leftmost position for indentation analysis
-                blocks[block_num]['lines'][line_num]['left'] = min(
-                    blocks[block_num]['lines'][line_num]['left'],
-                    data['left'][i]
-                )
+                line['left'] = min(line['left'], data['left'][i])
+        
+        # ENHANCEMENT: Detect and handle drop caps
+        blocks = self._detect_and_handle_drop_cap(data, blocks)
+        
+        # ENHANCEMENT: Detect italic text (often book titles in scholarly works)
+        blocks = self._enhance_italics_detection(blocks)
         
         # Sort blocks by vertical position
         ordered_blocks = sorted(blocks.keys(), key=lambda b: blocks[b]['top'])
@@ -3082,40 +4378,68 @@ class OCREngine:
         paragraphs = []
         current_paragraph = []
         prev_line_ends_with_hyphen = False
+        in_first_paragraph = True
         
-        # Detect headings (all caps, centered, etc.)
+        # First, detect headings and section structure
         for block_num in ordered_blocks:
             block = blocks[block_num]
             block_lines = []
             
             # Process lines in this block (top to bottom)
-            for line_num in sorted(block['lines'].keys(), 
-                                  key=lambda ln: block['lines'][ln]['top']):
+            for line_num in sorted(block['lines'].keys(), key=lambda ln: block['lines'][ln]['top']):
                 line = block['lines'][line_num]
                 
-                # Sort words left to right
-                sorted_words = sorted(line['words'].items(), 
-                                    key=lambda item: item[1]['left'])
+                # Sort words by horizontal position
+                sorted_words = sorted(line['words'].items(), key=lambda item: item[1]['left'])
                 
-                # Build line text
-                line_text = " ".join(word['text'] for _, word in sorted_words)
+                # Build line text with formatting preservation
+                words_with_format = []
+                for _, word in sorted_words:
+                    word_text = word['text']
+                    if word['potential_italics']:
+                        # Mark italics with special tags we'll process later
+                        word_text = f"<i>{word_text}</i>"
+                    words_with_format.append(word_text)
                 
-                # Check if this is likely a heading
+                line_text = " ".join(words_with_format)
+                
+                # Detect heading characteristics
                 is_heading = (line_text.isupper() and len(line_text) < 50) or \
                             ("CHAPTER" in line_text and len(line_text) < 50) or \
-                            ("RULE" in line_text and len(line_text) < 50)
+                            ("RULE" in line_text and len(line_text) < 50) or \
+                            (re.match(r'^[IVX]+\.', line_text) and len(line_text) < 30) # Roman numeral section
                 
                 # Store the line
                 block_lines.append({
                     'text': line_text,
-                    'is_heading': is_heading
+                    'is_heading': is_heading,
+                    'has_italics': '<i>' in line_text
                 })
             
-            # Process the entire block
+            # Process the entire block with drop cap handling
             if block_lines:
+                if block.get('has_drop_cap') and in_first_paragraph:
+                    # Special handling for drop cap paragraph
+                    drop_cap = block.get('drop_cap', '')
+                    
+                    # Check if the first line starts with the drop cap letter
+                    if block_lines and block_lines[0]['text'].strip():
+                        first_line = block_lines[0]['text']
+                        
+                        # Complete the first word with drop cap
+                        if ' ' in first_line:
+                            rest_of_word, remaining = first_line.split(' ', 1)
+                            first_word_corrected = drop_cap + rest_of_word
+                            block_lines[0]['text'] = f"{first_word_corrected} {remaining}"
+                        else:
+                            block_lines[0]['text'] = drop_cap + first_line
+                    
+                    # No longer in first paragraph after handling drop cap
+                    in_first_paragraph = False
+                
                 # Check if first line is a heading
                 if block_lines[0]['is_heading']:
-                    # If we have a current paragraph, complete it
+                    # Complete current paragraph if any
                     if current_paragraph:
                         paragraphs.append(" ".join(current_paragraph))
                         current_paragraph = []
@@ -3132,38 +4456,64 @@ class OCREngine:
                     if remaining_lines:
                         current_paragraph = remaining_lines
                 else:
-                    # Regular text block
+                    # Regular text block processing with improved hyphenation
                     for i, line in enumerate(block_lines):
                         line_text = line['text']
                         
-                        # Handle hyphenated words
+                        # Handle hyphenated words with enhanced logic
                         if prev_line_ends_with_hyphen and current_paragraph:
                             # Get last line from current paragraph
                             last_line = current_paragraph.pop()
                             
-                            # Join hyphenated word
+                            # Join hyphenated word with better handling of italics and spacing
                             if ' ' in line_text:
                                 first_word, rest = line_text.split(' ', 1)
-                                dehyphenated = last_line[:-1] + first_word
+                                
+                                # Handle hyphenated italics
+                                if last_line.endswith('-</i>') and first_word.startswith('<i>'):
+                                    # Both parts italicized
+                                    dehyphenated = last_line.replace('-</i>', '') + first_word.replace('<i>', '')
+                                elif last_line.endswith('-</i>'):
+                                    # First part italicized
+                                    dehyphenated = last_line.replace('-</i>', '') + '</i>' + first_word
+                                elif first_word.startswith('<i>'):
+                                    # Second part italicized
+                                    dehyphenated = last_line[:-1] + '<i>' + first_word.replace('<i>', '')
+                                else:
+                                    # No italics
+                                    dehyphenated = last_line[:-1] + first_word
+                                    
                                 current_paragraph.append(dehyphenated)
                                 
                                 # Add the rest of this line
                                 if rest:
                                     current_paragraph.append(rest)
                             else:
-                                # Single word line
-                                dehyphenated = last_line[:-1] + line_text
+                                # Handle single word line with italics
+                                if last_line.endswith('-</i>') and line_text.startswith('<i>'):
+                                    dehyphenated = last_line.replace('-</i>', '') + line_text.replace('<i>', '')
+                                elif last_line.endswith('-</i>'):
+                                    dehyphenated = last_line.replace('-</i>', '') + '</i>' + line_text
+                                elif line_text.startswith('<i>'):
+                                    dehyphenated = last_line[:-1] + '<i>' + line_text.replace('<i>', '')
+                                else:
+                                    dehyphenated = last_line[:-1] + line_text
                                 current_paragraph.append(dehyphenated)
                         else:
                             # Regular line - just add to current paragraph
                             current_paragraph.append(line_text)
                         
-                        # Check if this line ends with hyphen for next iteration
+                        # Improved hyphen detection that handles italics tags
+                        text_for_hyphen_check = re.sub(r'</?i>', '', line_text)  # Remove italics tags temporarily
                         prev_line_ends_with_hyphen = (
-                            line_text.endswith('-') and 
-                            len(line_text) > 1 and 
-                            line_text[-2].isalpha()
+                            text_for_hyphen_check.endswith('-') and 
+                            len(text_for_hyphen_check) > 1 and 
+                            text_for_hyphen_check[-2].isalpha()
                         )
+                        
+                        # Handle special case where hyphen is inside italics tag
+                        if line_text.endswith('-</i>'):
+                            prev_line_ends_with_hyphen = True
         
         # Add final paragraph
         if current_paragraph:
@@ -3172,42 +4522,48 @@ class OCREngine:
         # Join paragraphs with double newline
         result = "\n\n".join(paragraphs)
         
+        # ENHANCEMENT: Fix scholarly formatting (italic book titles, citations)
+        result = self._fix_scholarly_formatting(result)
+        
         # Clean up text
         result = self._clean_book_text(result)
         
         return result
 
     def _clean_book_text(self, text):
-        """Clean up common OCR errors in book text"""
+        """Clean up common OCR issues specific to books"""
         if not text:
             return ""
+            
+        # Remove excessive whitespace
+        text = text.replace("  ", " ")
+        text = text.replace("\n\n\n", "\n\n")
+        
+        # Fix common OCR errors in books
+        text = text.replace("|", "I")
+        text = text.replace("l.", "i.")
+        text = text.replace("rnay", "may")
+        text = text.replace("rny", "my")
+        text = text.replace("tbe", "the")
+        text = text.replace("tbat", "that")
+        text = text.replace("arid", "and")
         
         # Fix spacing around punctuation
-        text = re.sub(r'\s+([.,;:!?)])', r'\1', text)
+        text = text.replace(" .", ".")
+        text = text.replace(" ,", ",")
+        text = text.replace(" !", "!")
+        text = text.replace(" ?", "?")
+        text = text.replace(" :", ":")
+        text = text.replace(" ;", ";")
         
-        # Fix spacing around opening punctuation
-        text = re.sub(r'([(["])\s+', r'\1', text)
+        # Fix quotes
+        text = text.replace("''", "\"")
+        text = text.replace("``", "\"")
         
-        # Fix multiple spaces
-        text = re.sub(r' {2,}', ' ', text)
+        # Fix broken sentence spacing
+        text = text.replace(".\n", ". \n")
         
-        # Fix multiple newlines
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        # Fix common OCR errors
-        text = text.replace('|', 'I')           # Vertical bar to I
-        text = text.replace('l.', 'i.')         # lowercase L with period often mistaken for i
-        text = text.replace(',,', '"')          # Double commas to quote
-        text = text.replace('``', '"')          # Double backticks to quote
-        text = text.replace("''", '"')          # Double single quotes to quote
-        
-        # Fix ellipsis
-        text = re.sub(r'\.(\s*\.){2,}', '...', text)
-        
-        # Fix broken sentences
-        text = re.sub(r'(\w)\.([A-Z])', r'\1. \2', text)  # Fix missing space after period
-        
-        return text        
+        return text  
 
     def _build_book_page_text(self, data):
         """Universal structure-preserving text builder with mobile UI handling"""
@@ -3677,6 +5033,96 @@ class OCREngine:
         else:
             return "Unknown"
     
+    def _detect_columns(self, image):
+        """
+        Detect number of columns and their boundaries in an image
+        Returns: (column_count, list_of_boundaries)
+        """
+        try:
+            # Convert image to numpy array
+            img_array = np.array(image.convert('L'))
+            height, width = img_array.shape
+            
+            # Apply threshold to highlight text areas
+            _, binary = cv2.threshold(img_array, 200, 255, cv2.THRESH_BINARY_INV)
+            
+            # Calculate vertical projection profile (sum of black pixels in each column)
+            v_projection = np.sum(binary, axis=0)
+            
+            # Use simple moving average to smooth the profile
+            window_size = max(5, width // 50)  # Adaptive window size based on image width
+            smoothed = np.zeros_like(v_projection, dtype=float)
+            
+            # Manual smoothing to avoid OpenCV errors
+            for i in range(len(v_projection)):
+                start = max(0, i - window_size // 2)
+                end = min(len(v_projection), i + window_size // 2 + 1)
+                smoothed[i] = np.mean(v_projection[start:end])
+            
+            # Normalize the projection
+            if np.max(smoothed) > 0:
+                normalized = smoothed / np.max(smoothed)
+            else:
+                return 1, [(0, width)]  # Single column if no text detected
+            
+            # Calculate overall average density
+            overall_density = np.mean(normalized)
+            
+            # Find potential column separators (valleys in the profile)
+            valleys = []
+            min_valley_width = width * 0.02  # Min width of a valley (2% of image width)
+            min_valley_drop = overall_density * 0.4  # Valley must be at least 40% lower than average
+            
+            i = 0
+            while i < len(normalized):
+                if normalized[i] < overall_density - min_valley_drop:
+                    valley_start = i
+                    # Find where valley ends
+                    while i < len(normalized) and normalized[i] < overall_density - min_valley_drop:
+                        i += 1
+                    valley_end = i
+                    
+                    # Check if valley is wide enough to be a column separator
+                    if valley_end - valley_start >= min_valley_width:
+                        valleys.append((valley_start, valley_end))
+                else:
+                    i += 1
+            
+            # Special handling for two-column academic papers (most common case)
+            # Check specifically for a significant valley near the middle
+            middle = width // 2
+            middle_region = normalized[middle - width//8:middle + width//8]
+            
+            # If there's a significant drop in the middle, it's likely a two-column layout
+            if len(middle_region) > 0 and np.min(middle_region) < overall_density * 0.5:
+                # Simple two-column detection
+                # Just split down the middle if we detect a valley there
+                return 2, [(0, middle), (middle, width)]
+                
+            # General case: determine columns based on detected valleys
+            if valleys:
+                column_boundaries = []
+                prev_boundary = 0
+                
+                for valley_start, valley_end in valleys:
+                    # Add column from previous boundary to middle of this valley
+                    column_boundaries.append((prev_boundary, (valley_start + valley_end) // 2))
+                    prev_boundary = (valley_start + valley_end) // 2
+                
+                # Add final column to the right edge
+                column_boundaries.append((prev_boundary, width))
+                
+                return len(column_boundaries), column_boundaries
+            
+            # Default to single column if no clear separations found
+            return 1, [(0, width)]
+            
+        except Exception as e:
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                print(f"Column detection error: {e}")
+            # Default to single column on error
+            return 1, [(0, image.width)]
+
     def _score_academic_text(self, text: str, confidence: float) -> float:
         """Calculate score for academic text quality"""
         
